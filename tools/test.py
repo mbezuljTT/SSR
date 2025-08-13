@@ -13,10 +13,11 @@ import copy
 import torch
 torch.multiprocessing.set_sharing_strategy('file_system')
 import warnings
+from torch.profiler import profile, record_function, ProfilerActivity
 from mmcv import Config, DictAction
 from mmcv.cnn import fuse_conv_bn
 from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
-from mmcv.runner import (get_dist_info, init_dist, load_checkpoint,
+from mmcv.runner import (get_dist_info, init_dist, load_checkpoint, save_checkpoint,
                          wrap_fp16_model)
 
 from mmdet3d.apis import single_gpu_test
@@ -33,6 +34,75 @@ import json
 
 import warnings
 warnings.filterwarnings("ignore")
+
+def single_gpu_test_with_profiler(model, data_loader, profiler_args):
+    """Test model with single gpu and profiler enabled.
+    
+    Args:
+        model (nn.Module): Model to be tested.
+        data_loader (nn.Dataloader): Pytorch data loader.
+        profiler_args: Arguments containing profiler configuration.
+        
+    Returns:
+        list[dict]: The prediction results.
+    """
+    # Create profiler output directory
+    os.makedirs(profiler_args.profiler_output_dir, exist_ok=True)
+    
+    # Configure profiler
+    profiler_schedule = torch.profiler.schedule(
+        wait=profiler_args.profiler_wait,
+        warmup=profiler_args.profiler_warmup,
+        active=profiler_args.profiler_active,
+        repeat=profiler_args.profiler_repeat
+    )
+    
+    def trace_handler(prof):
+        # Save Chrome trace
+        chrome_trace_path = os.path.join(profiler_args.profiler_output_dir, f"trace_{prof.step_num}.json")
+        prof.export_chrome_trace(chrome_trace_path)
+        print(f"Profiler trace saved to: {chrome_trace_path}")
+        
+        # Save detailed profiler table
+        table_path = os.path.join(profiler_args.profiler_output_dir, f"profiler_table_{prof.step_num}.txt")
+        with open(table_path, 'w') as f:
+            f.write("CUDA time sorted by CUDA time:\n")
+            f.write(prof.key_averages().table(sort_by="cuda_time_total", row_limit=50))
+            f.write("\n\nCPU time sorted by CPU time:\n")
+            f.write(prof.key_averages().table(sort_by="cpu_time_total", row_limit=50))
+            f.write("\n\nMemory sorted by self CUDA memory:\n")
+            f.write(prof.key_averages().table(sort_by="self_cuda_memory_usage", row_limit=50))
+        print(f"Profiler table saved to: {table_path}")
+    
+    print("Running inference with profiler enabled...")
+    # Create profiler context and run inference with step tracking
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        schedule=profiler_schedule,
+        on_trace_ready=trace_handler,
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True
+    ) as prof:
+        model.eval()
+        results = []
+        dataset = data_loader.dataset
+        prog_bar = mmcv.ProgressBar(len(dataset))
+        
+        for i, data in enumerate(data_loader):
+            with record_function("inference_step"):
+                with torch.no_grad():
+                    result = model(return_loss=False, rescale=True, **data)
+            
+            results.extend(result)
+            batch_size = len(result)
+            for _ in range(batch_size):
+                prog_bar.update()
+            
+            # Step the profiler
+            prof.step()
+        
+        return results
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -103,6 +173,35 @@ def parse_args():
         default='none',
         help='job launcher')
     parser.add_argument('--local_rank', type=int, default=0)
+    parser.add_argument(
+        '--enable-profiler',
+        action='store_true',
+        help='Enable torch profiler for performance analysis')
+    parser.add_argument(
+        '--profiler-output-dir',
+        type=str,
+        default='./profiler_results',
+        help='Directory to save profiler results')
+    parser.add_argument(
+        '--profiler-wait',
+        type=int,
+        default=1,
+        help='Number of steps to wait before profiling')
+    parser.add_argument(
+        '--profiler-warmup',
+        type=int,
+        default=1,
+        help='Number of warmup steps for profiler')
+    parser.add_argument(
+        '--profiler-active',
+        type=int,
+        default=3,
+        help='Number of active profiling steps')
+    parser.add_argument(
+        '--profiler-repeat',
+        type=int,
+        default=1,
+        help='Number of profiling cycles to repeat')
     args = parser.parse_args()
     if 'LOCAL_RANK' not in os.environ:
         os.environ['LOCAL_RANK'] = str(args.local_rank)
@@ -198,15 +297,14 @@ def main():
     if args.seed is not None:
         set_random_seed(args.seed, deterministic=args.deterministic)
 
-    # build the dataloader
-    dataset = build_dataset(cfg.data.test)
-    data_loader = build_dataloader(
-        dataset,
-        samples_per_gpu=samples_per_gpu,
-        workers_per_gpu=cfg.data.workers_per_gpu,
-        dist=distributed,
-        shuffle=False,
-        nonshuffler_sampler=cfg.data.nonshuffler_sampler,
+    # Create mockup dataset and dataloader
+    from tools.mockup_dataset import create_mockup_dataloader
+    
+    # Create mockup dataloader with a small number of samples for testing
+    data_loader = create_mockup_dataloader(
+        batch_size=samples_per_gpu,
+        num_workers=0,  # Force single-threaded to avoid shared memory issues
+        num_samples=10  # Small number for quick testing
     )
 
     # build the model and load checkpoint
@@ -215,7 +313,29 @@ def main():
     fp16_cfg = cfg.get('fp16', None)
     if fp16_cfg is not None:
         wrap_fp16_model(model)
+    # mbezulj no checkpoint, nothing to load
+    def init_and_save_checkpoint(model, cfg, checkpoint):
+        model.init_weights()
+        from mmdet import __version__ as mmdet_version
+        from mmdet3d import __version__ as mmdet3d_version
+        from mmseg import __version__ as mmseg_version
+        cfg.checkpoint_config.meta = dict(
+            mmdet_version=mmdet_version,
+            mmseg_version=mmseg_version,
+            mmdet3d_version=mmdet3d_version,
+            config=cfg.pretty_text,
+            CLASSES=5,  # datasets[0].CLASSES,
+            PALETTE=None  # datasets[0].PALETTE for segmentors
+        )
+
+        save_checkpoint(model,
+                        filename=checkpoint,
+                        optimizer=None,
+                        meta=None,
+                        file_client_args=None)
+    # init_and_save_checkpoint(model, cfg, args.checkpoint)
     checkpoint = load_checkpoint(model, args.checkpoint, map_location='cpu')
+
     if args.fuse_conv_bn:
         model = fuse_conv_bn(model)
     # old versions did not save class info in checkpoints, this walkaround is
@@ -223,18 +343,27 @@ def main():
     if 'CLASSES' in checkpoint.get('meta', {}):
         model.CLASSES = checkpoint['meta']['CLASSES']
     else:
-        model.CLASSES = dataset.CLASSES
+        # Use default nuScenes classes for mockup
+        model.CLASSES = [
+            'car', 'truck', 'construction_vehicle', 'bus', 'trailer', 'barrier',
+            'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
+        ]
     # palette for visualization in segmentation tasks
     if 'PALETTE' in checkpoint.get('meta', {}):
         model.PALETTE = checkpoint['meta']['PALETTE']
-    elif hasattr(dataset, 'PALETTE'):
-        # segmentation dataset has `PALETTE` attribute
-        model.PALETTE = dataset.PALETTE
+    else:
+        # No PALETTE for mockup dataset
+        model.PALETTE = None
 
     if not distributed:
         # assert False
         model = MMDataParallel(model, device_ids=[0])
-        outputs = single_gpu_test(model, data_loader, args.show, args.show_dir)
+        
+        # Set up profiler if enabled
+        if args.enable_profiler:
+            outputs = single_gpu_test_with_profiler(model, data_loader, args)
+        else:
+            outputs = single_gpu_test(model, data_loader, args.show, args.show_dir)
     else:
         model = MMDistributedDataParallel(
             model.cuda(),
@@ -259,7 +388,8 @@ def main():
         kwargs['jsonfile_prefix'] = osp.join('test', args.config.split(
             '/')[-1].split('.')[-2], time.ctime().replace(' ', '_').replace(':', '_'))
         if args.format_only:
-            dataset.format_results(outputs['bbox_results'], **kwargs)
+            # For mockup dataset, skip format_results since we don't have a real dataset
+            print("Skipping format_results for mockup dataset")
 
         if args.eval:
             eval_kwargs = cfg.get('evaluation', {}).copy()
@@ -271,7 +401,19 @@ def main():
                 eval_kwargs.pop(key, None)
             eval_kwargs.update(dict(metric=args.eval, **kwargs))
 
-            print(dataset.evaluate(outputs['bbox_results'], **eval_kwargs))
+            # For mockup dataset, skip evaluation since we don't have ground truth
+            print("Skipping evaluation for mockup dataset - no ground truth available")
+        
+        # Print profiler summary if enabled
+        if args.enable_profiler:
+            print(f"\n{'='*60}")
+            print("TORCH PROFILER SUMMARY")
+            print(f"{'='*60}")
+            print(f"Profiler results saved to: {args.profiler_output_dir}")
+            print("Files generated:")
+            print("  - trace_*.json: Chrome trace files (can be viewed in chrome://tracing)")
+            print("  - profiler_table_*.txt: Detailed performance tables")
+            print(f"{'='*60}")
     
         # # # NOTE: record to json
         # json_path = args.json_dir
